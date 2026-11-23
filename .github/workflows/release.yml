@@ -1,0 +1,54 @@
+name: Release
+
+# Pushing a v* tag attaches omarchy-vlc-linux-x86_64.zip (this setup with a
+# launcher that runs from wherever it is unpacked) to the tag's release. The
+# Neko Legends Control Center downloads and launches that zip. There is nothing
+# to compile: it sets up the VLC that Arch packages.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the scripts
+        run: |
+          bash -n bin/install
+          bash -n bin/uninstall
+          sh -n omarchy-vlc-portable
+          python3 -m py_compile omarchy-vlc-dnd
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq desktop-file-utils lua5.4
+          desktop-file-validate vlc.desktop
+          luac5.4 -p hypr/vlc.lua
+
+      - name: Package
+        run: |
+          mkdir -p dist/omarchy-vlc
+          install -Dm755 omarchy-vlc-portable dist/omarchy-vlc/omarchy-vlc-portable
+          install -Dm755 omarchy-vlc-dnd dist/omarchy-vlc/omarchy-vlc-dnd
+          install -Dm755 bin/install dist/omarchy-vlc/bin/install
+          install -Dm755 bin/uninstall dist/omarchy-vlc/bin/uninstall
+          install -Dm644 hypr/vlc.lua dist/omarchy-vlc/hypr/vlc.lua
+          install -Dm644 vlc.desktop dist/omarchy-vlc/vlc.desktop
+          install -Dm644 LICENSE dist/omarchy-vlc/LICENSE
+          install -Dm644 LINUX-README.txt dist/omarchy-vlc/README.txt
+          (cd dist && zip -qry ../omarchy-vlc-linux-x86_64.zip omarchy-vlc)
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "Omarchy VLC ${tag#v}" --generate-notes
+          fi
+          gh release upload "$tag" omarchy-vlc-linux-x86_64.zip --clobber

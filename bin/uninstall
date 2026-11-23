@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Removes the Hyprland rules, the drop helper and the "Omarchy VLC" launcher entry; the stock
+# "VLC media player" entry returns. VLC and its codec plugin stay installed
+# (remove the plugin with: sudo pacman -R vlc-plugin-ffmpeg).
+set -euo pipefail
+
+hypr="$HOME/.config/hypr"
+apps="$HOME/.local/share/applications"
+
+sed -i '/(omarchy-vlc)\.$/d; /require("hypr.vlc")/d' "$hypr/hyprland.lua"
+rm -f "$hypr/vlc.lua" "$apps/vlc.desktop"
+pkill -f "$HOME/.local/share/omarchy-vlc/omarchy-vlc-dnd" 2>/dev/null || true
+rm -rf "$HOME/.local/share/omarchy-vlc"
+update-desktop-database "$apps" 2>/dev/null || true
+hyprctl reload >/dev/null
+echo "Removed the Omarchy VLC window rules, drop helper and launcher entry."

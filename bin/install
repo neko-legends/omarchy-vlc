@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Sets VLC up for Omarchy: the codec plugin, Hyprland window rules with a title
+# bar, a helper that makes dropping files on VLC work, and the "Omarchy VLC"
+# app launcher entry. Safe to run again: it only changes what is missing or out
+# of date. omarchy-vlc-portable runs it at every start.
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+hypr="$HOME/.config/hypr"
+apps="$HOME/.local/share/applications"
+share="$HOME/.local/share/omarchy-vlc"
+vlcrc="$HOME/.config/vlc/vlcrc"
+changed=0
+
+if ! command -v hyprctl >/dev/null || [[ ! -f "$hypr/hyprland.lua" ]]; then
+  echo "omarchy-vlc is for Omarchy: Hyprland with a Lua config at $hypr/hyprland.lua." >&2
+  exit 1
+fi
+
+# VLC itself, and the FFmpeg plugin: Arch splits VLC into plugin packages, and
+# without the FFmpeg one H.264, HEVC, MPEG-4 and AAC do not play. The D-Bus one
+# is how dropped files reach VLC.
+missing=()
+for package in vlc vlc-plugin-ffmpeg vlc-plugin-dbus; do
+  pacman -Q "$package" >/dev/null 2>&1 || missing+=("$package")
+done
+# Title bars come from this Omarchy package. Without it VLC still floats and
+# moves with SUPER + left mouse.
+if ! pacman -Q omarchy-hyprland-titlebars >/dev/null 2>&1 &&
+  pacman -Si omarchy-hyprland-titlebars >/dev/null 2>&1; then
+  missing+=(omarchy-hyprland-titlebars)
+fi
+
+if ((${#missing[@]})); then
+  echo "==> Installing ${missing[*]}"
+  # A terminal can ask for the password; started from the Control Center or the
+  # app launcher there is none, so polkit asks in a dialog.
+  if [[ -t 0 ]]; then
+    sudo pacman -S --needed --noconfirm -- "${missing[@]}"
+  else
+    pkexec pacman -S --needed --noconfirm -- "${missing[@]}"
+  fi
+fi
+
+# Copies, not links: the Control Center replaces this folder on every update.
+if ! cmp -s "$repo/omarchy-vlc-dnd" "$share/omarchy-vlc-dnd"; then
+  echo "==> Installing the drop helper to $share/omarchy-vlc-dnd"
+  mkdir -p "$share"
+  install -m 755 "$repo/omarchy-vlc-dnd" "$share/omarchy-vlc-dnd"
+  pkill -f "$share/omarchy-vlc-dnd" 2>/dev/null || true
+  changed=1
+fi
+
+if ! cmp -s "$repo/hypr/vlc.lua" "$hypr/vlc.lua" || [[ -L "$hypr/vlc.lua" ]]; then
+  echo "==> Installing Hyprland rules to $hypr/vlc.lua"
+  rm -f "$hypr/vlc.lua"
+  install -m 644 "$repo/hypr/vlc.lua" "$hypr/vlc.lua"
+  changed=1
+fi
+
+if ! grep -q 'require("hypr.vlc")' "$hypr/hyprland.lua"; then
+  echo "==> Loading them from $hypr/hyprland.lua"
+  cp "$hypr/hyprland.lua" "$hypr/hyprland.lua.bak.$(date +%s)"
+  printf '\n-- VLC floats, with a title bar to drag it across monitors (omarchy-vlc).\nrequire("hypr.vlc")\n' >>"$hypr/hyprland.lua"
+  changed=1
+fi
+
+# Same id as the stock entry, so "Omarchy VLC" replaces "VLC media player" in
+# the app launcher and every file association that points at vlc.desktop stays.
+if ! cmp -s "$repo/vlc.desktop" "$apps/vlc.desktop"; then
+  echo "==> Adding \"Omarchy VLC\" to the app launcher"
+  mkdir -p "$apps"
+  install -m 644 "$repo/vlc.desktop" "$apps/vlc.desktop"
+  update-desktop-database "$apps" 2>/dev/null || true
+fi
+
+# VLC resizes its window to every video's own size, which fights the window
+# manager. The launcher entry passes --no-qt-video-autoresize; this covers a
+# plain `vlc` from a terminal. VLC rewrites the file when it exits, so it is
+# left alone while VLC runs.
+if ! grep -qx 'qt-video-autoresize=0' "$vlcrc" 2>/dev/null && ! pgrep -x vlc >/dev/null; then
+  echo "==> Turning off VLC's resize-to-video in $vlcrc"
+  mkdir -p "$(dirname "$vlcrc")"
+  touch "$vlcrc"
+  cp "$vlcrc" "$vlcrc.bak.$(date +%s)"
+  if grep -qE '^#?qt-video-autoresize=' "$vlcrc"; then
+    sed -i -E 's/^#?qt-video-autoresize=.*/qt-video-autoresize=0/' "$vlcrc"
+  elif grep -q '^\[qt\]' "$vlcrc"; then
+    sed -i '/^\[qt\]/a qt-video-autoresize=0' "$vlcrc"
+  else
+    printf '[qt]\nqt-video-autoresize=0\n' >>"$vlcrc"
+  fi
+fi
+
+if ((changed)); then
+  echo "==> Reloading Hyprland"
+  hyprctl reload >/dev/null
+  # Loading the title bar plugin reloads the config once more.
+  sleep 1
+  errors="$(hyprctl configerrors)"
+  if [[ -n "${errors//[[:space:]]/}" ]]; then
+    echo "Hyprland config errors:" >&2
+    echo "$errors" >&2
+    exit 1
+  fi
+fi
+
+# Hyprland starts the drop helper with each VLC window; this covers a VLC that
+# is already open. A second copy exits at once.
+if pgrep -x vlc >/dev/null; then
+  setsid "$share/omarchy-vlc-dnd" </dev/null >/dev/null 2>&1 &
+fi
+
+echo "Omarchy VLC is set up. Drag it by its title bar, also onto another monitor."

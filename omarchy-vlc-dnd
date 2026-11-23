@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""Makes dropping files onto VLC work under Hyprland.
+
+VLC 3 is an X11 app, so on Omarchy it runs through XWayland. When something is
+dragged from a Wayland app (Nautilus, a browser) onto an XWayland window,
+Hyprland hands the window the right data while the drag hovers over it, but at
+the moment of the drop keyboard focus lands on the window and Hyprland swaps
+the drag's data for the clipboard's. VLC asks for the data after the drop, so
+it gets whatever is on the clipboard instead of the file that was dropped.
+
+This helper registers as the drop proxy (XdndProxy) of every VLC window. Drops
+then come here instead: it reads the dragged files while the drag still hovers,
+and on the drop hands them to that VLC over D-Bus (MPRIS). Dragging things
+around inside VLC, such as playlist items, does not go through the proxy.
+
+It needs nothing but Python and libxcb. One instance runs per session.
+"""
+
+import ctypes
+import ctypes.util
+import fcntl
+import os
+import re
+import select
+import struct
+import subprocess
+import sys
+import time
+from ctypes import POINTER, Structure, c_char_p, c_int, c_uint8, c_uint16, c_int16, c_uint32, c_void_p
+
+LOG = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "omarchy-vlc-dnd.log")
+MEDIA_PLAYER = "/org/mpris/MediaPlayer2"
+NO_TRACK = "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+
+
+def log(message):
+    try:
+        with open(LOG, "a") as file:
+            file.write(time.strftime("%H:%M:%S ") + message + "\n")
+    except OSError:
+        pass
+
+
+# --- libxcb ------------------------------------------------------------------
+
+xcb = ctypes.CDLL(ctypes.util.find_library("xcb") or "libxcb.so.1")
+libc = ctypes.CDLL(None)
+libc.free.argtypes = [c_void_p]
+
+
+class Cookie(Structure):
+    _fields_ = [("sequence", ctypes.c_uint)]
+
+
+class ScreenIterator(Structure):
+    _fields_ = [("data", c_void_p), ("rem", c_int), ("index", c_int)]
+
+
+def declare(name, restype, *argtypes):
+    function = getattr(xcb, name)
+    function.restype = restype
+    function.argtypes = list(argtypes)
+    return function
+
+
+xcb_connect = declare("xcb_connect", c_void_p, c_char_p, POINTER(c_int))
+xcb_connection_has_error = declare("xcb_connection_has_error", c_int, c_void_p)
+xcb_get_file_descriptor = declare("xcb_get_file_descriptor", c_int, c_void_p)
+xcb_get_setup = declare("xcb_get_setup", c_void_p, c_void_p)
+xcb_setup_roots_iterator = declare("xcb_setup_roots_iterator", ScreenIterator, c_void_p)
+xcb_generate_id = declare("xcb_generate_id", c_uint32, c_void_p)
+xcb_flush = declare("xcb_flush", c_int, c_void_p)
+xcb_poll_for_event = declare("xcb_poll_for_event", c_void_p, c_void_p)
+xcb_create_window = declare(
+    "xcb_create_window", Cookie, c_void_p, c_uint8, c_uint32, c_uint32, c_int16, c_int16, c_uint16, c_uint16,
+    c_uint16, c_uint16, c_uint32, c_uint32, c_void_p,
+)  # fmt: skip
+xcb_change_window_attributes = declare("xcb_change_window_attributes", Cookie, c_void_p, c_uint32, c_uint32, c_void_p)
+xcb_intern_atom = declare("xcb_intern_atom", Cookie, c_void_p, c_uint8, c_uint16, c_char_p)
+xcb_intern_atom_reply = declare("xcb_intern_atom_reply", c_void_p, c_void_p, Cookie, c_void_p)
+xcb_change_property = declare(
+    "xcb_change_property", Cookie, c_void_p, c_uint8, c_uint32, c_uint32, c_uint32, c_uint8, c_uint32, c_void_p
+)
+xcb_get_property = declare("xcb_get_property", Cookie, c_void_p, c_uint8, c_uint32, c_uint32, c_uint32, c_uint32, c_uint32)
+xcb_get_property_reply = declare("xcb_get_property_reply", c_void_p, c_void_p, Cookie, c_void_p)
+xcb_get_property_value = declare("xcb_get_property_value", c_void_p, c_void_p)
+xcb_get_property_value_length = declare("xcb_get_property_value_length", c_int, c_void_p)
+xcb_query_tree = declare("xcb_query_tree", Cookie, c_void_p, c_uint32)
+xcb_query_tree_reply = declare("xcb_query_tree_reply", c_void_p, c_void_p, Cookie, c_void_p)
+xcb_query_tree_children = declare("xcb_query_tree_children", POINTER(c_uint32), c_void_p)
+xcb_query_tree_children_length = declare("xcb_query_tree_children_length", c_int, c_void_p)
+xcb_get_geometry = declare("xcb_get_geometry", Cookie, c_void_p, c_uint32)
+xcb_get_geometry_reply = declare("xcb_get_geometry_reply", c_void_p, c_void_p, Cookie, c_void_p)
+xcb_send_event = declare("xcb_send_event", Cookie, c_void_p, c_uint8, c_uint32, c_uint32, c_char_p)
+xcb_convert_selection = declare("xcb_convert_selection", Cookie, c_void_p, c_uint32, c_uint32, c_uint32, c_uint32, c_uint32)
+
+ATOM_ATOM, ATOM_CARDINAL, ATOM_STRING, ATOM_WINDOW, ATOM_WM_CLASS = 4, 6, 31, 33, 67
+CLIENT_MESSAGE, SELECTION_NOTIFY, MAP_NOTIFY = 33, 31, 19
+CW_EVENT_MASK, SUBSTRUCTURE_NOTIFY = 2048, 524288
+INPUT_ONLY = 2
+XDND_VERSION = 5
+
+
+class X:
+    def __init__(self):
+        self.conn = xcb_connect(None, None)
+        if not self.conn or xcb_connection_has_error(self.conn):
+            raise SystemExit("omarchy-vlc-dnd: cannot connect to the X server (XWayland)")
+        self.fd = xcb_get_file_descriptor(self.conn)
+        screen = xcb_setup_roots_iterator(xcb_get_setup(self.conn)).data
+        self.root = c_uint32.from_address(screen).value
+        self.atoms = {}
+
+    def atom(self, name):
+        if name not in self.atoms:
+            raw = name.encode()
+            reply = xcb_intern_atom_reply(self.conn, xcb_intern_atom(self.conn, 0, len(raw), raw), None)
+            self.atoms[name] = struct.unpack_from("I", ctypes.string_at(reply, 12), 8)[0] if reply else 0
+            libc.free(reply)
+        return self.atoms[name]
+
+    def create_window(self):
+        window = xcb_generate_id(self.conn)
+        xcb_create_window(self.conn, 0, window, self.root, -10, -10, 1, 1, 0, INPUT_ONLY, 0, 0, None)
+        return window
+
+    def watch_root(self):
+        mask = c_uint32(SUBSTRUCTURE_NOTIFY)
+        xcb_change_window_attributes(self.conn, self.root, CW_EVENT_MASK, ctypes.byref(mask))
+
+    def set_property(self, window, name, kind, values):
+        data = struct.pack("%dI" % len(values), *values)
+        xcb_change_property(self.conn, 0, window, self.atom(name), kind, 32, len(values), data)
+
+    def get_property(self, window, prop, delete=False):
+        """Returns (type atom, bytes), or (0, b"") when the property is not there."""
+        cookie = xcb_get_property(self.conn, 1 if delete else 0, window, prop, 0, 0, 1 << 24)
+        reply = xcb_get_property_reply(self.conn, cookie, None)
+        if not reply:
+            return 0, b""
+        kind = struct.unpack_from("I", ctypes.string_at(reply, 12), 8)[0]
+        data = ctypes.string_at(xcb_get_property_value(reply), xcb_get_property_value_length(reply))
+        libc.free(reply)
+        return kind, data
+
+    def children(self, window):
+        reply = xcb_query_tree_reply(self.conn, xcb_query_tree(self.conn, window), None)
+        if not reply:
+            return []
+        pointer = xcb_query_tree_children(reply)
+        result = [pointer[i] for i in range(xcb_query_tree_children_length(reply))]
+        libc.free(reply)
+        return result
+
+    def geometry(self, window):
+        reply = xcb_get_geometry_reply(self.conn, xcb_get_geometry(self.conn, window), None)
+        if not reply:
+            return None
+        x, y, width, height = struct.unpack_from("hhHH", ctypes.string_at(reply, 20), 12)
+        libc.free(reply)
+        return x, y, width, height
+
+    def client_message(self, window, kind, data):
+        event = struct.pack("BBHII5I", CLIENT_MESSAGE, 32, 0, window, kind, *data)
+        xcb_send_event(self.conn, 0, window, 0, event)
+
+    def convert_selection(self, requestor, selection, target, prop):
+        xcb_convert_selection(self.conn, requestor, selection, target, prop, 0)
+
+    def flush(self):
+        xcb_flush(self.conn)
+
+    def events(self, timeout):
+        """Yields (type, raw 32 bytes) for the events that arrive within timeout seconds."""
+        self.flush()
+        while True:
+            event = xcb_poll_for_event(self.conn)
+            if not event:
+                if xcb_connection_has_error(self.conn):
+                    raise SystemExit("omarchy-vlc-dnd: lost the X server")
+                if not select.select([self.fd], [], [], timeout)[0]:
+                    return
+                continue
+            raw = ctypes.string_at(event, 32)
+            libc.free(event)
+            yield raw[0] & 0x7F, raw
+
+
+# --- VLC over D-Bus ----------------------------------------------------------
+
+
+def busctl(*args):
+    try:
+        done = subprocess.run(["busctl", "--user", *args], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        log("busctl failed: %s" % error)
+        return None
+    if done.returncode != 0:
+        log("busctl %s: %s" % (" ".join(args[:2]), done.stderr.strip()))
+        return None
+    return done.stdout
+
+
+def vlc_bus_name(pid):
+    """The MPRIS name of the VLC with this pid, else of any VLC."""
+    names = []
+    for line in (busctl("list", "--no-legend") or "").splitlines():
+        fields = line.split()
+        if len(fields) > 1 and fields[0].startswith("org.mpris.MediaPlayer2.vlc"):
+            names.append((fields[0], fields[1]))
+    for name, owner in names:
+        if pid and owner == str(pid):
+            return name
+    return names[0][0] if names else None
+
+
+def send_to_vlc(pid, uris):
+    name = vlc_bus_name(pid)
+    if not name:
+        log("no VLC on D-Bus (is vlc-plugin-dbus installed?)")
+        return
+    status = busctl("get-property", name, MEDIA_PLAYER, "org.mpris.MediaPlayer2.Player", "PlaybackStatus") or ""
+    # Something already playing keeps playing and the files queue up behind it;
+    # otherwise the first one starts.
+    play = "Playing" not in status
+    for uri in uris:
+        busctl("call", name, MEDIA_PLAYER, "org.mpris.MediaPlayer2.TrackList", "AddTrack", "sob", uri, NO_TRACK,
+               "true" if play else "false")  # fmt: skip
+        play = False
+    log("sent %d item(s) to %s" % (len(uris), name))
+
+
+# --- drops -------------------------------------------------------------------
+
+URI = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://\S")
+
+
+def parse_uris(data):
+    lines = [line.strip() for line in data.decode("utf-8", "replace").replace("\0", "").splitlines()]
+    return [line for line in lines if line and not line.startswith("#") and URI.match(line)]
+
+
+class Proxy:
+    def __init__(self):
+        self.x = X()
+        self.window = self.x.create_window()
+        self.x.set_property(self.window, "XdndAware", ATOM_ATOM, [XDND_VERSION])
+        self.x.set_property(self.window, "XdndProxy", ATOM_WINDOW, [self.window])
+        self.property = self.x.atom("_OMARCHY_VLC_DND")
+        self.selection = self.x.atom("XdndSelection")
+        self.wanted = [self.x.atom(name) for name in ("text/uri-list", "text/plain;charset=utf-8", "UTF8_STRING", "text/plain")]
+        self.vlc_windows = set()
+        self.reset()
+        self.x.watch_root()
+        for window in self.x.children(self.x.root):
+            self.adopt(window)
+        self.x.flush()
+
+    def reset(self):
+        self.source = 0
+        self.target_type = 0
+        self.uris = None  # None: no answer yet
+        self.position = None
+
+    def adopt(self, window):
+        """Points a VLC window's drops at this proxy."""
+        _, wm_class = self.x.get_property(window, ATOM_WM_CLASS)
+        if b"vlc" not in wm_class.lower().split(b"\0"):
+            return
+        if not self.x.get_property(window, self.x.atom("XdndAware"))[1]:
+            return
+        self.x.set_property(window, "XdndProxy", ATOM_WINDOW, [self.window])
+        if window not in self.vlc_windows:
+            self.vlc_windows.add(window)
+            log("proxying VLC window 0x%x" % window)
+
+    def vlc_pid_at(self, position):
+        best = 0
+        for window in list(self.vlc_windows):
+            box = self.x.geometry(window)
+            if not box:
+                self.vlc_windows.discard(window)
+                continue
+            _, data = self.x.get_property(window, self.x.atom("_NET_WM_PID"))
+            pid = struct.unpack("I", data[:4])[0] if len(data) >= 4 else 0
+            best = best or pid
+            if position and box[0] <= position[0] < box[0] + box[2] and box[1] <= position[1] < box[1] + box[3]:
+                return pid
+        return best
+
+    def request_data(self):
+        if self.target_type:
+            self.x.convert_selection(self.window, self.selection, self.target_type, self.property)
+
+    def on_enter(self, data):
+        self.reset()
+        self.source = data[0]
+        if data[1] & 1:
+            _, raw = self.x.get_property(self.source, self.x.atom("XdndTypeList"))
+            offered = list(struct.unpack("%dI" % (len(raw) // 4), raw[: len(raw) // 4 * 4]))
+        else:
+            offered = [atom for atom in data[2:5] if atom]
+        self.target_type = next((atom for atom in self.wanted if atom in offered), 0)
+        # Now, not at the drop: this is while Hyprland still serves the drag's data.
+        self.request_data()
+
+    def on_position(self, data):
+        self.source = data[0]
+        self.position = (data[2] >> 16, data[2] & 0xFFFF)
+        accept = 1 if self.target_type else 0
+        self.x.client_message(self.source, self.x.atom("XdndStatus"), [self.window, accept, 0, 0, self.x.atom("XdndActionCopy")])
+
+    def on_selection(self, raw):
+        prop = struct.unpack_from("I", raw, 20)[0]
+        if not prop:
+            log("the drag source gave no data")
+            self.uris = self.uris or []
+            return
+        _, data = self.x.get_property(self.window, self.property, delete=True)
+        self.uris = parse_uris(data)
+
+    def on_drop(self, data):
+        source = data[0]
+        if self.uris is None:
+            # The answer to the request made on enter is still on its way.
+            deadline = time.monotonic() + 1.5
+            while self.uris is None and time.monotonic() < deadline:
+                for kind, raw in self.x.events(0.1):
+                    if kind == SELECTION_NOTIFY:
+                        self.on_selection(raw)
+                        break
+        uris, pid = self.uris or [], self.vlc_pid_at(self.position)
+        self.x.client_message(source, self.x.atom("XdndFinished"), [self.window, 1 if uris else 0, self.x.atom("XdndActionCopy"), 0, 0])
+        self.x.flush()
+        self.reset()
+        if uris:
+            log("drop: %s" % ", ".join(uris))
+            send_to_vlc(pid, uris)
+        else:
+            log("drop: nothing VLC can open")
+
+    def run(self):
+        log("started, proxy window 0x%x" % self.window)
+        handlers = {"XdndEnter": self.on_enter, "XdndPosition": self.on_position, "XdndDrop": self.on_drop}
+        names = {self.x.atom(name): name for name in ("XdndEnter", "XdndPosition", "XdndDrop", "XdndLeave")}
+        while True:
+            for kind, raw in self.x.events(3600):
+                if kind == MAP_NOTIFY:
+                    self.adopt(struct.unpack_from("I", raw, 8)[0])
+                elif kind == SELECTION_NOTIFY:
+                    self.on_selection(raw)
+                elif kind == CLIENT_MESSAGE:
+                    name = names.get(struct.unpack_from("I", raw, 8)[0])
+                    if name == "XdndLeave":
+                        self.reset()
+                    elif name:
+                        handlers[name](struct.unpack_from("5I", raw, 12))
+                self.x.flush()
+
+
+def main():
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    lock = open(os.path.join(runtime, "omarchy-vlc-dnd.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0  # already running
+    try:
+        if os.path.getsize(LOG) > 200_000:
+            os.truncate(LOG, 0)
+    except OSError:
+        pass
+    Proxy().run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

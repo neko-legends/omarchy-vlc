@@ -1,0 +1,19 @@
+#!/bin/sh
+# Starts Omarchy VLC from wherever this folder was unpacked (the zip the Neko
+# Legends Control Center installs). It first makes sure the setup is in place
+# (bin/install changes nothing when it already is), then runs the system VLC.
+here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+log="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-vlc-install.log"
+
+mkdir -p "$(dirname "$log")"
+if ! "$here/bin/install" >"$log" 2>&1; then
+  notify-send "Omarchy VLC" "Setup did not finish. See $log" 2>/dev/null
+fi
+
+if ! command -v vlc >/dev/null; then
+  notify-send "Omarchy VLC" "VLC is not installed. Run: sudo pacman -S vlc vlc-plugin-ffmpeg vlc-plugin-dbus" 2>/dev/null
+  echo "VLC is not installed. Run: sudo pacman -S vlc vlc-plugin-ffmpeg vlc-plugin-dbus" >&2
+  exit 1
+fi
+
+exec vlc --no-qt-video-autoresize --started-from-file "$@"
